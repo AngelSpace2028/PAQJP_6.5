@@ -16,15 +16,17 @@ from typing import List, Dict, Tuple, Optional
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler('compression_results.log')]
+    handlers=[logging.StreamHandler()]
 )
 
 # === Constants ===
 PROGNAME = "PAQJP_6_Smart"
-HUFFMAN_THRESHOLD = 1024
+HUFFMAN_THRESHOLD = 1024  # Bytes threshold for Huffman vs. PAQ compression
 PI_DIGITS_FILE = "pi_digits.txt"
 PRIMES = [p for p in range(2, 256) if all(p % d != 0 for d in range(2, int(p**0.5)+1))]
-MEM = 1 << 15
+MEM = 1 << 15  # 32,768
+MAX_BITS = 2**28  # Maximum bits for transform_14
+MIN_BITS = 2      # Minimum bits for transform_14
 
 # === Dictionary file list ===
 DICTIONARY_FILES = [
@@ -32,10 +34,11 @@ DICTIONARY_FILES = [
     "eng_news_2005_1M-sources.txt", "eng_news_2005_1M-co_n.txt",
     "eng_news_2005_1M-co_s.txt", "eng_news_2005_1M-inv_so.txt",
     "eng_news_2005_1M-meta.txt", "Dictionary.txt",
-    "the-complete-reference-html-css-fifth-edition.txt", "francais.txt", "espanol.txt", "deutsch.txt", "ukenglish.txt", "vertebrate-palaeontology-dict.txt"
+    "the-complete-reference-html-css-fifth-edition.txt", "francais.txt", "espanol.txt",
+    "deutsch.txt", "ukenglish.txt", "vertebrate-palaeontology-dict.txt"
 ]
 
-# === DNA Encoding Table ===
+# === DNA Encoding Table for GenomeCompress ===
 DNA_ENCODING_TABLE = {
     'AAAA': 0b00000, 'AAAC': 0b00001, 'AAAG': 0b00010, 'AAAT': 0b00011,
     'AACC': 0b00100, 'AACG': 0b00101, 'AACT': 0b00110, 'AAGG': 0b00111,
@@ -50,6 +53,7 @@ DNA_DECODING_TABLE = {v: k for k, v in DNA_ENCODING_TABLE.items()}
 
 # === Pi Digits Functions ===
 def save_pi_digits(digits: List[int], filename: str = PI_DIGITS_FILE) -> bool:
+    """Save base-10 pi digits to a file."""
     try:
         with open(filename, 'w') as f:
             f.write(','.join(str(d) for d in digits))
@@ -60,6 +64,7 @@ def save_pi_digits(digits: List[int], filename: str = PI_DIGITS_FILE) -> bool:
         return False
 
 def load_pi_digits(filename: str = PI_DIGITS_FILE, expected_count: int = 3) -> Optional[List[int]]:
+    """Load base-10 pi digits from a file."""
     try:
         if not os.path.isfile(filename):
             logging.warning(f"Pi digits file {filename} does not exist")
@@ -89,10 +94,12 @@ def load_pi_digits(filename: str = PI_DIGITS_FILE, expected_count: int = 3) -> O
         return None
 
 def generate_pi_digits(num_digits: int = 3, filename: str = PI_DIGITS_FILE) -> List[int]:
+    """Generate or load pi digits, mapping to 0-255 range."""
     loaded_digits = load_pi_digits(filename, num_digits)
     if loaded_digits is not None:
         return loaded_digits
     try:
+        # Requires mpmath: pip install mpmath (optional)
         from mpmath import mp
         mp.dps = num_digits
         pi_digits = [int(d) for d in mp.pi.digits(10)[0]]
@@ -105,6 +112,12 @@ def generate_pi_digits(num_digits: int = 3, filename: str = PI_DIGITS_FILE) -> L
         mapped_digits = [(d * 255 // 9) % 256 for d in pi_digits]
         save_pi_digits(mapped_digits, filename)
         return mapped_digits
+    except ImportError:
+        logging.warning("mpmath not installed, using fallback pi digits")
+        fallback_digits = [3, 1, 4]
+        mapped_fallback = [(d * 255 // 9) % 256 for d in fallback_digits[:num_digits]]
+        save_pi_digits(mapped_fallback, filename)
+        return mapped_fallback
     except Exception as e:
         logging.error(f"Failed to generate pi digits: {e}")
         fallback_digits = [3, 1, 4]
@@ -122,6 +135,7 @@ class Filetype(Enum):
     TEXT = 3
 
 class Node:
+    """Huffman tree node."""
     def __init__(self, left=None, right=None, symbol=None):
         self.left = left
         self.right = right
@@ -131,6 +145,7 @@ class Node:
         return self.left is None and self.right is None
 
 def transform_with_prime_xor_every_3_bytes(data, repeat=100):
+    """XOR every third byte with prime-derived values."""
     transformed = bytearray(data)
     for prime in PRIMES:
         xor_val = prime if prime == 2 else max(1, math.ceil(prime * 4096 / 28672))
@@ -140,6 +155,7 @@ def transform_with_prime_xor_every_3_bytes(data, repeat=100):
     return bytes(transformed)
 
 def transform_with_pattern_chunk(data, chunk_size=4):
+    """XOR each chunk with 0xFF."""
     transformed = bytearray()
     for i in range(0, len(data), chunk_size):
         chunk = data[i:i + chunk_size]
@@ -147,6 +163,7 @@ def transform_with_pattern_chunk(data, chunk_size=4):
     return bytes(transformed)
 
 def is_prime(n):
+    """Check if a number is prime."""
     if n < 2:
         return False
     if n == 2:
@@ -159,6 +176,7 @@ def is_prime(n):
     return True
 
 def find_nearest_prime_around(n):
+    """Find the nearest prime number to n."""
     offset = 0
     while True:
         if is_prime(n - offset):
@@ -236,13 +254,13 @@ class StateTable:
             [140, 252, 0, 41]
         ]
 
-
 # === Smart Compressor ===
 class SmartCompressor:
     def __init__(self):
         self.dictionaries = self.load_dictionaries()
 
     def load_dictionaries(self):
+        """Load dictionary files for hash lookup."""
         data = []
         for filename in DICTIONARY_FILES:
             if os.path.exists(filename):
@@ -257,12 +275,15 @@ class SmartCompressor:
         return data
 
     def compute_sha256(self, data):
+        """Compute SHA-256 hash as hex."""
         return hashlib.sha256(data).hexdigest()
 
     def compute_sha256_binary(self, data):
+        """Compute SHA-256 hash as bytes."""
         return hashlib.sha256(data).digest()
 
     def find_hash_in_dictionaries(self, hash_hex):
+        """Search for hash in dictionary files."""
         for filename in DICTIONARY_FILES:
             if not os.path.exists(filename):
                 continue
@@ -277,6 +298,7 @@ class SmartCompressor:
         return None
 
     def generate_8byte_sha(self, data):
+        """Generate 8-byte SHA-256 prefix."""
         try:
             return hashlib.sha256(data).digest()[:8]
         except Exception as e:
@@ -284,6 +306,7 @@ class SmartCompressor:
             return None
 
     def paq_compress(self, data):
+        """Compress data using PAQ9a."""
         if not data:
             logging.warning("paq_compress: Empty input, returning empty bytes")
             return b''
@@ -300,6 +323,7 @@ class SmartCompressor:
             return None
 
     def paq_decompress(self, data):
+        """Decompress data using PAQ9a."""
         if not data:
             logging.warning("paq_decompress: Empty input, returning empty bytes")
             return b''
@@ -312,301 +336,182 @@ class SmartCompressor:
             return None
 
     def reversible_transform(self, data):
+        """Apply reversible XOR transform with 0xAA."""
         logging.info("Applying XOR transform (0xAA)")
         transformed = bytes(b ^ 0xAA for b in data)
         logging.info("XOR transform complete")
         return transformed
 
     def reverse_reversible_transform(self, data):
+        """Reverse XOR transform with 0xAA."""
         logging.info("Reversing XOR transform (0xAA)")
-        transformed = bytes(b ^ 0xAA for b in data)
-        logging.info("Reverse XOR transform complete")
-        return transformed
+        return self.reversible_transform(data)  # XOR is symmetric
 
-    def compress(self, data, input_filename):
-        if not data:
-            logging.warning("SmartCompressor: Empty input, returning empty bytes")
-            return b''
-        hash_hex = self.compute_sha256(data)
-        if any(x in input_filename.lower() for x in ["words", "lines", "sentence"]) and input_filename.lower().endswith(".paq"):
-            found = self.find_hash_in_dictionaries(hash_hex)
-            if found:
-                sha = self.generate_8byte_sha(data)
-                if sha:
-                    logging.info(f"Found dictionary match for {input_filename}, returning 8-byte SHA")
-                    return sha
-        transformed = self.reversible_transform(data)
+    def compress(self, input_data, input_file):
+        """Compress data using Smart Compressor."""
+        if not input_data:
+            logging.warning("Empty input, returning minimal output")
+            return bytes([0])
+
+        original_hash = self.compute_sha256(input_data)
+        logging.info(f"SHA-256 of input: {original_hash[:16]}...")
+
+        found = self.find_hash_in_dictionaries(original_hash)
+        if found:
+            logging.info(f"Hash found in dictionary: {found}")
+        else:
+            logging.info("Hash not found, proceeding with compression")
+
+        if input_file.endswith(".paq") and any(x in input_file for x in ["words", "lines", "sentence"]):
+            sha = self.generate_8byte_sha(input_data)
+            if sha and len(input_data) > 8:
+                logging.info(f"SHA-8 for .paq file: {sha.hex()}")
+                return sha
+            logging.info("Original smaller than SHA, skipping compression")
+            return None
+
+        transformed = self.reversible_transform(input_data)
         compressed = self.paq_compress(transformed)
-        if compressed is None or len(compressed) >= len(data):
-            logging.warning("SmartCompressor: Compression failed or not efficient, returning original data")
-            return data
-        hash_binary = self.compute_sha256_binary(data)
-        logging.info(f"SmartCompressor: Compressed size = {len(compressed) + len(hash_binary)} bytes")
-        return hash_binary + compressed
+        if compressed is None:
+            logging.error("Compression failed")
+            return None
 
-    def decompress(self, data, input_filename):
-        if not data:
-            logging.warning("SmartCompressor: Empty input, returning empty bytes")
-            return b''
-        if len(data) == 8 and any(x in input_filename.lower() for x in ["words", "lines", "sentence"]) and input_filename.lower().endswith(".paq"):
-            for filename in DICTIONARY_FILES:
-                if not os.path.exists(filename):
-                    continue
-                try:
-                    with open(filename, "r", encoding="utf-8", errors="ignore") as f:
-                        original_data = f.read().encode('utf-8')
-                        if self.generate_8byte_sha(original_data) == data:
-                            logging.info(f"Decompressed {input_filename} using dictionary match")
-                            return original_data
-                except Exception as e:
-                    logging.warning(f"Error checking dictionary {filename}: {e}")
-        if len(data) < 32:
-            logging.error("SmartCompressor: Data too short for hash + compressed data")
+        if len(compressed) < len(input_data):
+            output = self.compute_sha256_binary(input_data) + compressed
+            logging.info(f"Smart compression: Original {len(input_data)} bytes, Compressed {len(compressed)} bytes")
+            return output
+        else:
+            logging.info("Compression not efficient, returning None")
             return None
-        hash_binary = data[:32]
-        compressed = data[32:]
-        decompressed = self.paq_decompress(compressed)
+
+    def decompress(self, input_data):
+        """Decompress data using Smart Compressor."""
+        if len(input_data) < 32:
+            logging.error("Input too short for Smart Compressor")
+            return None
+
+        stored_hash = input_data[:32]
+        compressed_data = input_data[32:]
+
+        decompressed = self.paq_decompress(compressed_data)
         if decompressed is None:
-            logging.error("SmartCompressor: Decompression failed")
             return None
+
         original = self.reverse_reversible_transform(decompressed)
-        if self.compute_sha256_binary(original) != hash_binary:
-            logging.error("SmartCompressor: Hash verification failed")
+        computed_hash = self.compute_sha256_binary(original)
+        if computed_hash == stored_hash:
+            logging.info("Hash verification successful")
+            return original
+        else:
+            logging.error("Hash verification failed")
             return None
-        logging.info("SmartCompressor: Decompression successful")
-        return original
 
 # === PAQJP Compressor ===
 class PAQJPCompressor:
     def __init__(self):
-        self.seed_table = self.generate_seed_table()
+        self.PI_DIGITS = PI_DIGITS
+        self.PRIMES = PRIMES
+        self.seed_tables = self.generate_seed_tables()
+        self.SQUARE_OF_ROOT = 2
+        self.ADD_NUMBERS = 1
+        self.MULTIPLY = 3
+        self.fibonacci = self.generate_fibonacci(100)
+        self.state_table = StateTable()
 
-    def generate_seed_table(self):
-        random.seed(42)
-        return [random.randint(0, 255) for _ in range(256)]
+    def generate_fibonacci(self, n: int) -> List[int]:
+        """Generate Fibonacci sequence up to n terms."""
+        fib = [0, 1]
+        for i in range(2, n):
+            fib.append(fib[i-1] + fib[i-2])
+        return fib
 
-    def transform_01(self, data, repeat=100):
-        return transform_with_prime_xor_every_3_bytes(data, repeat)
+    def generate_seed_tables(self, num_tables=126, table_size=256, min_val=5, max_val=255, seed=42):
+        """Generate random seed tables."""
+        random.seed(seed)
+        return [[random.randint(min_val, max_val) for _ in range(table_size)] for _ in range(num_tables)]
 
-    def reverse_transform_01(self, data, repeat=100):
-        return transform_with_prime_xor_every_3_bytes(data, repeat)
+    def get_seed(self, table_idx: int, value: int) -> int:
+        """Get seed value from table."""
+        if 0 <= table_idx < len(self.seed_tables):
+            return self.seed_tables[table_idx][value % len(self.seed_tables[table_idx])]
+        return 0
 
-    def transform_03(self, data):
-        return transform_with_pattern_chunk(data)
+    def calculate_frequencies(self, binary_str):
+        """Calculate bit frequencies."""
+        if not binary_str:
+            logging.warning("Empty binary string, returning empty frequencies")
+            return {}
+        frequencies = {}
+        for bit in binary_str:
+            frequencies[bit] = frequencies.get(bit, 0) + 1
+        return frequencies
 
-    def reverse_transform_03(self, data):
-        return transform_with_pattern_chunk(data)
-
-    def transform_04(self, data):
-        transformed = bytearray()
-        for i, b in enumerate(data):
-            transformed.append((b - i) % 256)
-        return bytes(transformed)
-
-    def reverse_transform_04(self, data):
-        transformed = bytearray()
-        for i, b in enumerate(data):
-            transformed.append((b + i) % 256)
-        return bytes(transformed)
-
-    def transform_05(self, data):
-        transformed = bytearray()
-        for b in data:
-            transformed.append(((b << 3) | (b >> 5)) & 0xFF)
-        return bytes(transformed)
-
-    def reverse_transform_05(self, data):
-        transformed = bytearray()
-        for b in data:
-            transformed.append(((b >> 3) | (b << 5)) & 0xFF)
-        return bytes(transformed)
-
-    def transform_06(self, data):
-        random.seed(42)
-        substitution = list(range(256))
-        random.shuffle(substitution)
-        transformed = bytearray()
-        for b in data:
-            transformed.append(substitution[b])
-        return bytes(transformed)
-
-    def reverse_transform_06(self, data):
-        random.seed(42)
-        substitution = list(range(256))
-        random.shuffle(substitution)
-        reverse_substitution = [0] * 256
-        for i, v in enumerate(substitution):
-            reverse_substitution[v] = i
-        transformed = bytearray()
-        for b in data:
-            transformed.append(reverse_substitution[b])
-        return bytes(transformed)
-
-    def transform_07(self, data):
-        transformed = bytearray(data)
-        size = len(data) % 256
-        for i in range(len(data)):
-            transformed[i] ^= PI_DIGITS[i % len(PI_DIGITS)] ^ size
-        return bytes(transformed)
-
-    def reverse_transform_07(self, data):
-        return self.transform_07(data)
-
-    def transform_08(self, data):
-        transformed = bytearray(data)
-        for i in range(len(data)):
-            nearest_prime = find_nearest_prime_around(data[i])
-            transformed[i] ^= nearest_prime ^ PI_DIGITS[i % len(PI_DIGITS)]
-        return bytes(transformed)
-
-    def reverse_transform_08(self, data):
-        return self.transform_08(data)
-
-    def transform_09(self, data):
-        transformed = bytearray(data)
-        for i in range(len(data)):
-            nearest_prime = find_nearest_prime_around(data[i])
-            transformed[i] ^= nearest_prime ^ self.seed_table[i % 256] ^ PI_DIGITS[i % len(PI_DIGITS)]
-        return bytes(transformed)
-
-    def reverse_transform_09(self, data):
-        return self.transform_09(data)
-
-    def transform_10(self, data):
-        transformed = bytearray(data)
-        seed = 42
-        for i in range(len(data)):
-            if i > 0 and data[i-1] == ord('X') and data[i] == ord('1'):
-                seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-                transformed[i] ^= (seed >> 16) & 0xFF
-        return bytes(transformed)
-
-    def reverse_transform_10(self, data):
-        return self.transform_10(data)
-
-    def transform_11(self, data):
-        best_transformed = data
-        best_size = len(data)
-        for y in range(256):
-            transformed = bytearray(data)
-            for i in range(len(data)):
-                transformed[i] = (transformed[i] + y) % 256
-            compressed = self.paq_compress(transformed)
-            if compressed and len(compressed) < best_size:
-                best_transformed = transformed
-                best_size = len(compressed)
-        return bytes(best_transformed)
-
-    def reverse_transform_11(self, data):
-        best_transformed = data
-        best_size = len(data)
-        for y in range(256):
-            transformed = bytearray(data)
-            for i in range(len(data)):
-                transformed[i] = (transformed[i] - y) % 256
-            compressed = self.paq_compress(transformed)
-            if compressed and len(compressed) < best_size:
-                best_transformed = transformed
-                best_size = len(compressed)
-        return bytes(best_transformed)
-
-    def transform_12(self, data):
-        transformed = bytearray(data)
-        a, b = 0, 1
-        for i in range(len(data)):
-            transformed[i] ^= (a & 0xFF)
-            a, b = b, (a + b) % 256
-        return bytes(transformed)
-
-    def reverse_transform_12(self, data):
-        return self.transform_12(data)
-
-    def transform_13(self, data):
-        if not self.seed_table:
-            logging.warning("transform_13: Empty state table, returning original data")
-            return data
-        transformed = bytearray()
-        underflow = bytearray()
-        state = 0
-        for b in data:
-            if state >= len(self.seed_table):
-                logging.warning(f"transform_13: State {state} exceeds table size, using modulo")
-                state = state % len(self.seed_table)
-            transformed.append((b - self.seed_table[state]) % 256)
-            underflow.append(1 if b < self.seed_table[state] else 0)
-            state = self.seed_table[state]
-        return bytes(transformed + underflow)
-
-    def reverse_transform_13(self, data):
-        if not self.seed_table:
-            logging.warning("reverse_transform_13: Empty state table, returning original data")
-            return data
-        if len(data) < 2:
-            logging.error("reverse_transform_13: Data too short")
+    def build_huffman_tree(self, frequencies):
+        """Build Huffman tree from frequencies."""
+        if not frequencies:
+            logging.warning("No frequencies, returning None")
             return None
-        half = len(data) // 2
-        transformed = bytearray(data[:half])
-        underflow = data[half:]
-        state = 0
-        for i in range(len(transformed)):
-            if state >= len(self.seed_table):
-                logging.warning(f"reverse_transform_13: State {state} exceeds table size, using modulo")
-                state = state % len(self.seed_table)
-            transformed[i] = (transformed[i] + self.seed_table[state] + (256 if underflow[i] else 0)) % 256
-            state = self.seed_table[state]
-        return bytes(transformed)
+        heap = [(freq, Node(symbol=symbol)) for symbol, freq in frequencies.items()]
+        heapq.heapify(heap)
+        while len(heap) > 1:
+            freq1, node1 = heapq.heappop(heap)
+            freq2, node2 = heapq.heappop(heap)
+            new_node = Node(left=node1, right=node2)
+            heapq.heappush(heap, (freq1 + freq2, new_node))
+        return heap[0][1]
 
-    def transform_14(self, data):
-        transformed = bytearray(data)
-        i = 0
-        while i < len(data) - 1:
-            if data[i] == ord('0') and data[i+1] == ord('1'):
-                for prime in PRIMES:
-                    transformed[i] ^= prime
-                    transformed[i+1] ^= prime
-                i += 2
-            else:
-                i += 1
-        return bytes(transformed)
+    def generate_huffman_codes(self, root, current_code="", codes={}):
+        """Generate Huffman codes from tree."""
+        if root is None:
+            logging.warning("Huffman tree is None, returning empty codes")
+            return {}
+        if root.is_leaf():
+            codes[root.symbol] = current_code or "0"
+            return codes
+        if root.left:
+            self.generate_huffman_codes(root.left, current_code + "0", codes)
+        if root.right:
+            self.generate_huffman_codes(root.right, current_code + "1", codes)
+        return codes
 
-    def reverse_transform_14(self, data):
-        return self.transform_14(data)
+    def compress_data_huffman(self, binary_str):
+        """Compress binary string using Huffman coding."""
+        if not binary_str:
+            logging.warning("Empty binary string, returning empty compressed string")
+            return ""
+        frequencies = self.calculate_frequencies(binary_str)
+        huffman_tree = self.build_huffman_tree(frequencies)
+        if huffman_tree is None:
+            return ""
+        huffman_codes = self.generate_huffman_codes(huffman_tree)
+        if '0' not in huffman_codes:
+            huffman_codes['0'] = '0'
+        if '1' not in huffman_codes:
+            huffman_codes['1'] = '1'
+        return ''.join(huffman_codes[bit] for bit in binary_str)
 
-    def transform_genomecompress(self, data):
-        transformed = bytearray()
-        i = 0
-        while i < len(data):
-            for pattern, code in DNA_ENCODING_TABLE.items():
-                if data[i:i+len(pattern)] == pattern.encode():
-                    transformed.append(code)
-                    i += len(pattern)
-                    break
-            else:
-                logging.warning(f"transform_genomecompress: No match at position {i}, skipping byte")
-                transformed.append(data[i])
-                i += 1
-        return bytes(transformed)
-
-    def reverse_transform_genomecompress(self, data):
-        transformed = bytearray()
-        for b in data:
-            if b in DNA_DECODING_TABLE:
-                transformed.extend(DNA_DECODING_TABLE[b].encode())
-            else:
-                logging.warning(f"reverse_transform_genomecompress: Invalid code {b}, skipping")
-                transformed.append(b)
-        return bytes(transformed)
-
-    def transform_dynamic(self, data, marker):
-        transformed = bytearray(data)
-        for i in range(len(data)):
-            transformed[i] ^= self.seed_table[marker % len(self.seed_table)]
-        return bytes(transformed)
-
-    def reverse_transform_dynamic(self, data, marker):
-        return self.transform_dynamic(data, marker)
+    def decompress_data_huffman(self, compressed_str):
+        """Decompress Huffman-coded string."""
+        if not compressed_str:
+            logging.warning("Empty compressed string, returning empty decompressed string")
+            return ""
+        frequencies = self.calculate_frequencies(compressed_str)
+        huffman_tree = self.build_huffman_tree(frequencies)
+        if huffman_tree is None:
+            return ""
+        huffman_codes = self.generate_huffman_codes(huffman_tree)
+        reversed_codes = {code: symbol for symbol, code in huffman_codes.items()}
+        decompressed_str = ""
+        current_code = ""
+        for bit in compressed_str:
+            current_code += bit
+            if current_code in reversed_codes:
+                decompressed_str += reversed_codes[current_code]
+                current_code = ""
+        return decompressed_str
 
     def paq_compress(self, data):
+        """Compress data using PAQ9a."""
         if not data:
             logging.warning("paq_compress: Empty input, returning empty bytes")
             return b''
@@ -623,6 +528,7 @@ class PAQJPCompressor:
             return None
 
     def paq_decompress(self, data):
+        """Decompress data using PAQ9a."""
         if not data:
             logging.warning("paq_decompress: Empty input, returning empty bytes")
             return b''
@@ -634,272 +540,983 @@ class PAQJPCompressor:
             logging.error(f"PAQ9a decompression failed: {e}")
             return None
 
-    def huffman_compress(self, data):
+    def transform_genomecompress(self, data: bytes) -> bytes:
+        """Encode DNA sequence using GenomeCompress algorithm."""
         if not data:
-            logging.warning("huffman_compress: Empty input, returning empty bytes")
+            logging.warning("transform_genomecompress: Empty input, returning empty bytes")
             return b''
-        freq = [0] * 256
-        for b in data:
-            freq[b] += 1
-        heap = [[weight, [symbol, b'']] for symbol, weight in enumerate(freq) if weight]
-        heapq.heapify(heap)
-        while len(heap) > 1:
-            lo = heapq.heappop(heap)
-            hi = heapq.heappop(heap)
-            for pair in lo[1:]:
-                pair[1] = b'0' + pair[1]
-            for pair in hi[1:]:
-                pair[1] = b'1' + pair[1]
-            heapq.heappush(heap, [lo[0] + hi[0]] + lo[1:] + hi[1:])
-        codes = dict(heap[0][1:])
-        compressed = bytearray()
-        bits = ''
-        for b in data:
-            bits += ''.join(str(x) for x in codes[b])
-            while len(bits) >= 8:
-                compressed.append(int(bits[:8], 2))
-                bits = bits[8:]
-        if bits:
-            compressed.append(int(bits.ljust(8, '0'), 2))
-        header = bytearray()
-        for i, f in enumerate(freq):
-            if f:
-                header.extend([i, (f >> 8) & 0xFF, f & 0xFF])
-        header.append(0)
-        return bytes(header) + compressed
+        
+        try:
+            dna_str = data.decode('ascii').upper()
+            if not all(c in 'ACGT' for c in dna_str):
+                logging.error("transform_genomecompress: Invalid DNA sequence, contains non-ACGT characters")
+                return b''
+        except Exception as e:
+            logging.error(f"transform_genomecompress: Failed to decode input as DNA: {e}")
+            return b''
 
-    def huffman_decompress(self, data):
-        if not data:
-            logging.warning("huffman_decompress: Empty input, returning empty bytes")
-            return b''
-        freq = [0] * 256
+        n = len(dna_str)
+        r = n % 4
+        output_bits = []
         i = 0
-        while i < len(data) and data[i] != 0:
-            symbol = data[i]
-            if i + 2 >= len(data):
-                logging.error("huffman_decompress: Invalid header")
-                return None
-            freq[symbol] = (data[i+1] << 8) | data[i+2]
-            i += 3
-        i += 1
-        if i >= len(data):
-            logging.error("huffman_decompress: No compressed data")
-            return None
-        compressed = data[i:]
-        heap = [[weight, [symbol, b'']] for symbol, weight in enumerate(freq) if weight]
-        heapq.heapify(heap)
-        while len(heap) > 1:
-            lo = heapq.heappop(heap)
-            hi = heapq.heappop(heap)
-            for pair in lo[1:]:
-                pair[1] = b'0' + pair[1]
-            for pair in hi[1:]:
-                pair[1] = b'1' + pair[1]
-            heapq.heappush(heap, [lo[0] + hi[0]] + lo[1:] + hi[1:])
-        codes = dict((code, symbol) for symbol, code in heap[0][1:])
-        decompressed = bytearray()
-        bits = ''
-        for b in compressed:
-            bits += f'{b:08b}'
-        current_code = ''
-        for bit in bits:
-            current_code += bit
-            if current_code.encode() in codes:
-                decompressed.append(codes[current_code.encode()])
-                current_code = ''
-        return bytes(decompressed)
 
-    def compress_with_best_method(self, data, filetype, input_filename, mode="slow", force_transform=None):
-        if not data:
-            logging.warning("compress_with_best_method: Empty input, returning empty bytes")
-            return b''
-        if force_transform is not None:
-            transform_func = getattr(self, f'transform_{force_transform:02d}', None)
-            if force_transform == 0:
-                transform_func = self.transform_genomecompress
-            if transform_func is None:
-                logging.error(f"Invalid forced transform: {force_transform}")
-                return bytes([0]) + data
-            transformed = transform_func(data)
-            compressed = self.paq_compress(transformed)
-            if compressed is None:
-                logging.warning(f"Compression failed for transform {force_transform}, returning original data")
-                return bytes([0]) + data
-            logging.info(f"Forced transform {force_transform}: Compressed size = {len(compressed) + 1} bytes")
-            return bytes([force_transform]) + compressed
-        if len(data) < HUFFMAN_THRESHOLD:
-            compressed = self.huffman_compress(data)
-            logging.info(f"Huffman compression: Compressed size = {len(compressed) + 1} bytes")
-            return bytes([4]) + compressed
-        best_compressed = None
-        best_size = len(data)
-        best_marker = 0
-        transforms_to_try = [0, 7, 8, 9, 12, 13, 14] if filetype == Filetype.TEXT else [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
-        if mode == "slow":
-            transforms_to_try.extend(range(15, 256))
-        for marker in transforms_to_try:
-            try:
-                if marker == 0:
-                    transformed = self.transform_genomecompress(data)
-                elif marker in range(1, 15):
-                    transform_func = getattr(self, f'transform_{marker:02d}')
-                    transformed = transform_func(data)
+        while i < n - r:
+            if i + 8 <= n and dna_str[i:i+8] in DNA_ENCODING_TABLE:
+                segment = dna_str[i:i+8]
+                output_bits.extend([int(b) for b in format(DNA_ENCODING_TABLE[segment], '05b')])
+                i += 8
+            else:
+                segment = dna_str[i:i+4]
+                if segment in DNA_ENCODING_TABLE:
+                    output_bits.extend([int(b) for b in format(DNA_ENCODING_TABLE[segment], '05b')])
+                    i += 4
                 else:
-                    transformed = self.transform_dynamic(data, marker)
+                    logging.error(f"transform_genomecompress: Invalid 4-base segment at position {i}: {segment}")
+                    return b''
+
+        for j in range(i, n):
+            segment = dna_str[j]
+            output_bits.extend([int(b) for b in format(DNA_ENCODING_TABLE[segment], '05b')])
+
+        bit_str = ''.join(map(str, output_bits))
+        byte_length = (len(bit_str) + 7) // 8
+        byte_data = int(bit_str, 2).to_bytes(byte_length, 'big') if bit_str else b''
+        
+        logging.info(f"transform_genomecompress: Encoded {n} bases to {len(byte_data)} bytes")
+        return byte_data
+
+    def reverse_transform_genomecompress(self, data: bytes) -> bytes:
+        """Decode data compressed with GenomeCompress algorithm."""
+        if not data:
+            logging.warning("reverse_transform_genomecompress: Empty input, returning empty bytes")
+            return b''
+
+        bit_str = bin(int.from_bytes(data, 'big'))[2:].zfill(len(data) * 8)
+        output = []
+        i = 0
+
+        while i < len(bit_str):
+            if i + 5 > len(bit_str):
+                logging.warning(f"reverse_transform_genomecompress: Incomplete 5-bit segment at position {i}")
+                break
+            segment_bits = bit_str[i:i+5]
+            segment_val = int(segment_bits, 2)
+            if segment_val not in DNA_DECODING_TABLE:
+                logging.error(f"reverse_transform_genomecompress: Invalid 5-bit code: {segment_bits}")
+                return b''
+            output.append(DNA_DECODING_TABLE[segment_val])
+            i += 5
+
+        dna_str = ''.join(output)
+        result = dna_str.encode('ascii')
+        
+        logging.info(f"reverse_transform_genomecompress: Decoded {len(result)} bases")
+        return result
+
+    def transform_01(self, data, repeat=100):
+        """Transform using prime XOR every 3 bytes."""
+        if not data:
+            logging.warning("transform_01: Empty input, returning empty bytes")
+            return b''
+        return transform_with_prime_xor_every_3_bytes(data, repeat=repeat)
+
+    def reverse_transform_01(self, data, repeat=100):
+        """Reverse transform_01 (same as forward)."""
+        return self.transform_01(data, repeat=repeat)
+
+    def transform_03(self, data):
+        """Transform using chunk XOR with 0xFF."""
+        if not data:
+            logging.warning("transform_03: Empty input, returning empty bytes")
+            return b''
+        return transform_with_pattern_chunk(data)
+
+    def reverse_transform_03(self, data):
+        """Reverse transform_03 (same as forward)."""
+        return self.transform_03(data)
+
+    def transform_04(self, data, repeat=100):
+        """Subtract index modulo 256."""
+        if not data:
+            logging.warning("transform_04: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        for _ in range(repeat):
+            for i in range(len(transformed)):
+                transformed[i] = (transformed[i] - (i % 256)) % 256
+        return bytes(transformed)
+
+    def reverse_transform_04(self, data, repeat=100):
+        """Reverse transform_04 by adding index modulo 256."""
+        if not data:
+            logging.warning("reverse_transform_04: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        for _ in range(repeat):
+            for i in range(len(transformed)):
+                transformed[i] = (transformed[i] + (i % 256)) % 256
+        return bytes(transformed)
+
+    def transform_05(self, data, shift=3):
+        """Rotate bytes left by shift bits."""
+        if not data:
+            logging.warning("transform_05: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        for i in range(len(transformed)):
+            transformed[i] = ((transformed[i] << shift) | (transformed[i] >> (8 - shift))) & 0xFF
+        return bytes(transformed)
+
+    def reverse_transform_05(self, data, shift=3):
+        """Rotate bytes right by shift bits."""
+        if not data:
+            logging.warning("reverse_transform_05: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        for i in range(len(transformed)):
+            transformed[i] = ((transformed[i] >> shift) | (transformed[i] << (8 - shift))) & 0xFF
+        return bytes(transformed)
+
+    def transform_06(self, data, seed=42):
+        """Apply random substitution table."""
+        if not data:
+            logging.warning("transform_06: Empty input, returning empty bytes")
+            return b''
+        random.seed(seed)
+        substitution = list(range(256))
+        random.shuffle(substitution)
+        transformed = bytearray(data)
+        for i in range(len(transformed)):
+            transformed[i] = substitution[transformed[i]]
+        return bytes(transformed)
+
+    def reverse_transform_06(self, data, seed=42):
+        """Reverse random substitution table."""
+        if not data:
+            logging.warning("reverse_transform_06: Empty input, returning empty bytes")
+            return b''
+        random.seed(seed)
+        substitution = list(range(256))
+        random.shuffle(substitution)
+        reverse_substitution = [0] * 256
+        for i, v in enumerate(substitution):
+            reverse_substitution[v] = i
+        transformed = bytearray(data)
+        for i in range(len(transformed)):
+            transformed[i] = reverse_substitution[transformed[i]]
+        return bytes(transformed)
+
+    def transform_07(self, data, repeat=100):
+        """XOR with pi digits and size byte."""
+        if not data:
+            logging.warning("transform_07: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        pi_length = len(self.PI_DIGITS)
+        data_size_kb = len(data) / 1024
+        cycles = min(10, max(1, int(data_size_kb)))
+        logging.info(f"transform_07: {cycles} cycles for {len(data)} bytes")
+
+        shift = len(data) % pi_length
+        self.PI_DIGITS = self.PI_DIGITS[shift:] + self.PI_DIGITS[:shift]
+
+        size_byte = len(data) % 256
+        for i in range(len(transformed)):
+            transformed[i] ^= size_byte
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(transformed)):
+                pi_digit = self.PI_DIGITS[i % pi_length]
+                transformed[i] ^= pi_digit
+
+        return bytes(transformed)
+
+    def reverse_transform_07(self, data, repeat=100):
+        """Reverse transform_07."""
+        if not data:
+            logging.warning("reverse_transform_07: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        pi_length = len(self.PI_DIGITS)
+        data_size_kb = len(data) / 1024
+        cycles = min(10, max(1, int(data_size_kb)))
+        logging.info(f"reverse_transform_07: {cycles} cycles for {len(data)} bytes")
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(transformed)):
+                pi_digit = self.PI_DIGITS[i % pi_length]
+                transformed[i] ^= pi_digit
+
+        size_byte = len(data) % 256
+        for i in range(len(transformed)):
+            transformed[i] ^= size_byte
+
+        shift = len(data) % pi_length
+        self.PI_DIGITS = self.PI_DIGITS[-shift:] + self.PI_DIGITS[:-shift]
+
+        return bytes(transformed)
+
+    def transform_08(self, data, repeat=100):
+        """XOR with nearest prime and pi digits."""
+        if not data:
+            logging.warning("transform_08: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        pi_length = len(self.PI_DIGITS)
+        data_size_kb = len(data) / 1024
+        cycles = min(10, max(1, int(data_size_kb)))
+        logging.info(f"transform_08: {cycles} cycles for {len(data)} bytes")
+
+        shift = len(data) % pi_length
+        self.PI_DIGITS = self.PI_DIGITS[shift:] + self.PI_DIGITS[:shift]
+
+        size_prime = find_nearest_prime_around(len(data) % 256)
+        for i in range(len(transformed)):
+            transformed[i] ^= size_prime
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(transformed)):
+                pi_digit = self.PI_DIGITS[i % pi_length]
+                transformed[i] ^= pi_digit
+
+        return bytes(transformed)
+
+    def reverse_transform_08(self, data, repeat=100):
+        """Reverse transform_08."""
+        if not data:
+            logging.warning("reverse_transform_08: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        pi_length = len(self.PI_DIGITS)
+        data_size_kb = len(data) / 1024
+        cycles = min(10, max(1, int(data_size_kb)))
+        logging.info(f"reverse_transform_08: {cycles} cycles for {len(data)} bytes")
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(transformed)):
+                pi_digit = self.PI_DIGITS[i % pi_length]
+                transformed[i] ^= pi_digit
+
+        size_prime = find_nearest_prime_around(len(data) % 256)
+        for i in range(len(transformed)):
+            transformed[i] ^= size_prime
+
+        shift = len(data) % pi_length
+        self.PI_DIGITS = self.PI_DIGITS[-shift:] + self.PI_DIGITS[:-shift]
+
+        return bytes(transformed)
+
+    def transform_09(self, data, repeat=100):
+        """XOR with prime, seed, and pi digits."""
+        if not data:
+            logging.warning("transform_09: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        pi_length = len(self.PI_DIGITS)
+        data_size_kb = len(data) / 1024
+        cycles = min(10, max(1, int(data_size_kb)))
+        logging.info(f"transform_09: {cycles} cycles, {repeat} repeats for {len(data)} bytes")
+
+        shift = len(data) % pi_length
+        self.PI_DIGITS = self.PI_DIGITS[shift:] + self.PI_DIGITS[:shift]
+
+        size_prime = find_nearest_prime_around(len(data) % 256)
+        seed_idx = len(data) % len(self.seed_tables)
+        seed_value = self.get_seed(seed_idx, len(data))
+        for i in range(len(transformed)):
+            transformed[i] ^= size_prime ^ seed_value
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(transformed)):
+                pi_digit = self.PI_DIGITS[i % pi_length]
+                transformed[i] ^= pi_digit ^ (i % 256)
+
+        return bytes(transformed)
+
+    def reverse_transform_09(self, data, repeat=100):
+        """Reverse transform_09."""
+        if not data:
+            logging.warning("reverse_transform_09: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        pi_length = len(self.PI_DIGITS)
+        data_size_kb = len(data) / 1024
+        cycles = min(10, max(1, int(data_size_kb)))
+        logging.info(f"reverse_transform_09: {cycles} cycles, {repeat} repeats for {len(data)} bytes")
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(transformed)):
+                pi_digit = self.PI_DIGITS[i % pi_length]
+                transformed[i] ^= pi_digit ^ (i % 256)
+
+        size_prime = find_nearest_prime_around(len(data) % 256)
+        seed_idx = len(data) % len(self.seed_tables)
+        seed_value = self.get_seed(seed_idx, len(data))
+        for i in range(len(transformed)):
+            transformed[i] ^= size_prime ^ seed_value
+
+        shift = len(data) % pi_length
+        self.PI_DIGITS = self.PI_DIGITS[-shift:] + self.PI_DIGITS[:-shift]
+
+        return bytes(transformed)
+
+    def transform_10(self, data, repeat=100):
+        """XOR with value derived from 'X1' sequences."""
+        if not data:
+            logging.warning("transform_10: Empty input, returning empty bytes with n=0")
+            return bytes([0])
+        transformed = bytearray(data)
+        data_size_kb = len(data) / 1024
+        cycles = min(10, max(1, int(data_size_kb)))
+        logging.info(f"transform_10: {cycles} cycles, {repeat} repeats for {len(data)} bytes")
+
+        count = 0
+        for i in range(len(data) - 1):
+            if data[i] == 0x58 and data[i + 1] == 0x31:
+                count += 1
+        logging.info(f"transform_10: Found {count} 'X1' sequences")
+
+        n = (((count * self.SQUARE_OF_ROOT) + self.ADD_NUMBERS) // 3) * self.MULTIPLY
+        n = n % 256
+        logging.info(f"transform_10: Computed n = {n}")
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(transformed)):
+                transformed[i] ^= n
+
+        return bytes([n]) + bytes(transformed)
+
+    def reverse_transform_10(self, data, repeat=100):
+        """Reverse transform_10."""
+        if len(data) < 1:
+            logging.warning("reverse_transform_10: Data too short, returning empty bytes")
+            return b''
+        n = data[0]
+        transformed = bytearray(data[1:])
+        data_size_kb = len(data) / 1024
+        cycles = min(10, max(1, int(data_size_kb)))
+        logging.info(f"reverse_transform_10: {cycles} cycles, {repeat} repeats, n={n}")
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(transformed)):
+                transformed[i] ^= n
+
+        return bytes(transformed)
+
+    def transform_11(self, data, repeat=100):
+        """Test multiple y values for best compression."""
+        if not data:
+            logging.warning("transform_11: Empty input, returning y=0 with no data")
+            return struct.pack('B', 0)
+        y_values = list(range(1, 256, 5))  # Test every 5th value to speed up
+        best_result = None
+        best_y = None
+        best_size = float('inf')
+        zero_count = sum(1 for b in data if b == 0)
+        logging.info(f"transform_11: Testing {len(y_values)} y values for {len(data)} bytes, {zero_count} zeros")
+        for y in y_values:
+            transformed = bytearray(data)
+            for _ in range(repeat):
+                for i in range(len(transformed)):
+                    transformed[i] = (transformed[i] + y + 1) % 256
+            transformed = bytes(transformed)
+            try:
                 compressed = self.paq_compress(transformed)
-                if compressed and len(compressed) < best_size:
-                    best_compressed = compressed
+                if compressed is None:
+                    logging.warning(f"transform_11: Compression with y={y} failed")
+                    continue
+                if len(compressed) < best_size:
+                    best_result = compressed
+                    best_y = y
                     best_size = len(compressed)
-                    best_marker = marker
             except Exception as e:
-                logging.warning(f"Transform {marker} failed: {e}, skipping")
+                logging.warning(f"transform_11: Compression with y={y} failed: {e}")
+                continue
+        if best_result is None:
+            logging.error("transform_11: All compression failed, returning original with y=0")
+            return struct.pack('B', 0) + data
+        logging.info(f"transform_11: Selected y={best_y}, compressed size {best_size}")
+        return struct.pack('B', best_y) + best_result
+
+    def reverse_transform_11(self, data, repeat=100):
+        """Reverse transform_11."""
+        if len(data) < 1:
+            logging.warning("reverse_transform_11: Data too short, returning empty bytes")
+            return b''
+        y = struct.unpack('B', data[:1])[0]
+        compressed_data = data[1:]
+        if not compressed_data:
+            logging.warning("reverse_transform_11: No compressed data, returning empty bytes")
+            return b''
+        try:
+            decompressed = self.paq_decompress(compressed_data)
+            if not decompressed:
+                logging.warning("reverse_transform_11: Decompression empty")
+                return b''
+        except Exception as e:
+            logging.error(f"reverse_transform_11: Decompression failed: {e}")
+            return b''
+        transformed = bytearray(decompressed)
+        zero_count = sum(1 for b in transformed if b == 0)
+        logging.info(f"reverse_transform_11: {len(transformed)} bytes, y={y}, {zero_count} zeros")
+        for _ in range(repeat):
+            for i in range(len(transformed)):
+                transformed[i] = (transformed[i] - y - 1) % 256
+        zero_count_after = sum(1 for b in transformed if b == 0)
+        logging.info(f"reverse_transform_11: Restored, {zero_count_after} zeros")
+        return bytes(transformed)
+
+    def transform_12(self, data, repeat=100):
+        """XOR with Fibonacci sequence."""
+        if not data:
+            logging.warning("transform_12: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        data_size = len(data)
+        fib_length = len(self.fibonacci)
+        logging.info(f"transform_12: Fibonacci transform for {data_size} bytes, repeat={repeat}")
+        
+        for _ in range(repeat):
+            for i in range(len(transformed)):
+                fib_index = i % fib_length
+                fib_value = self.fibonacci[fib_index] % 256
+                transformed[i] ^= fib_value
+        
+        return bytes(transformed)
+
+    def reverse_transform_12(self, data, repeat=100):
+        """Reverse Fibonacci XOR transform."""
+        if not data:
+            logging.warning("reverse_transform_12: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        data_size = len(data)
+        fib_length = len(self.fibonacci)
+        logging.info(f"reverse_transform_12: Reversing Fibonacci for {data_size} bytes, repeat={repeat}")
+        
+        for _ in range(repeat):
+            for i in range(len(transformed)):
+                fib_index = i % fib_length
+                fib_value = self.fibonacci[fib_index] % 256
+                transformed[i] ^= fib_value
+        
+        return bytes(transformed)
+
+    def transform_13(self, data, repeat=100):
+        """Subtract StateTable values from bytes, handle underflow/overflow, append table value on underflow."""
+        if not data:
+            logging.warning("transform_13: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        table = [row[0] for row in self.state_table.table]
+        table_length = len(table)
+        appended_bytes = bytearray()
+        data_size_kb = len(data) / 1024
+        cycles = min(10, max(1, int(data_size_kb)))
+        logging.info(f"transform_13: {cycles} cycles, {repeat} repeats for {len(data)} bytes")
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(transformed)):
+                table_value = table[i % table_length]
+                result = transformed[i] - table_value
+                if result < 0:
+                    result += 256
+                    appended_bytes.append(table_value)
+                elif result > 255:
+                    result -= 255
+                transformed[i] = result % 256
+
+        result = bytes(transformed) + appended_bytes
+        logging.info(f"transform_13: Added {len(appended_bytes)} bytes to output, total {len(result)} bytes")
+        return result
+
+    def reverse_transform_13(self, data, repeat=100):
+        """Reverse transform_13 by adding StateTable values, accounting for appended bytes."""
+        if not data:
+            logging.warning("reverse_transform_13: Empty input, returning empty bytes")
+            return b''
+        transformed = bytearray(data)
+        table = [row[0] for row in self.state_table.table]
+        table_length = len(table)
+        data_size_kb = len(data) / 1024
+        cycles = min(10, max(1, int(data_size_kb)))
+        logging.info(f"reverse_transform_13: {cycles} cycles, {repeat} repeats for {len(data)} bytes")
+
+        appended_count = 0
+        underflow_positions = []
+        temp_transformed = bytearray(transformed)
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(data)):
+                if i >= len(temp_transformed):
+                    break
+                table_value = table[i % table_length]
+                original = temp_transformed[i]
+                result = original - table_value
+                if result < 0:
+                    underflow_positions.append((i, table_value))
+                    appended_count += 1
+
+        original_length = len(data) - appended_count
+        if original_length < 0:
+            logging.error("reverse_transform_13: Invalid appended byte count")
+            return b''
+        transformed = transformed[:original_length]
+
+        for _ in range(cycles * repeat // 10):
+            for i in range(len(transformed)):
+                table_value = table[i % table_length]
+                result = transformed[i]
+                if (i, table_value) in underflow_positions:
+                    result = (result + table_value - 256) % 256
+                else:
+                    result = (result + table_value) % 256
+                    if result > 255:
+                        result += 255
+                transformed[i] = result % 256
+
+        logging.info(f"reverse_transform_13: Restored {len(transformed)} bytes, estimated {appended_count} appended bytes")
+        return bytes(transformed)
+
+    def transform_14(self, data, repeat=255):
+        """Transform data by processing '01' and '0000'/'1111' patterns."""
+        if not data:
+            logging.warning("transform_14: Empty input, returning minimal output")
+            return struct.pack('B', 0)
+        
+        # Convert bytes to binary string
+        binary_str = bin(int.from_bytes(data, 'big'))[2:].zfill(len(data) * 8)
+        bit_length = len(binary_str)
+        if bit_length < MIN_BITS or bit_length > MAX_BITS:
+            logging.warning(f"transform_14: Input size {bit_length} bits out of range [{MIN_BITS}, {MAX_BITS}]")
+            return struct.pack('B', 0) + data
+        
+        # Determine cycles based on data size
+        data_size_kb = len(data) / 1024
+        max_cycles = min(255, max(1, int(data_size_kb)))
+        
+        # Select XOR bit based on prime
+        prime_index = len(data) % len(self.PRIMES)
+        xor_bit = '1' if self.PRIMES[prime_index] % 2 == 0 else '0'
+        
+        # Process "01" patterns
+        output_bits = list(binary_str)
+        iteration_count = 0
+        for _ in range(max_cycles):
+            temp_bits = []
+            i = 0
+            modified = False
+            while i < len(output_bits) - 2:
+                if output_bits[i:i+2] == ['0', '1']:
+                    temp_bits.extend(['0', '1'])
+                    next_bit = output_bits[i+2]
+                    temp_bits.append('0' if next_bit == xor_bit else '1')
+                    modified = True
+                    i += 3
+                else:
+                    temp_bits.append(output_bits[i])
+                    i += 1
+            temp_bits.extend(output_bits[i:])
+            output_bits = temp_bits
+            iteration_count += 1
+            if not modified or len(''.join(output_bits)) // 8 >= 32:
+                break
+        
+        # Process 4-bit patterns ("0000" or "1111") with StateTable
+        if len(output_bits) >= 4:
+            i = 0
+            while i < len(output_bits) - 4:
+                pattern_4 = ''.join(output_bits[i:i+4])
+                pattern_val = int(pattern_4, 2)
+                if pattern_val in [0b0000, 0b1111] and i + 4 < len(output_bits):
+                    state_value = self.state_table.table[pattern_val % len(self.state_table.table)][0] & 1
+                    output_bits[i + 4] = '0' if output_bits[i + 4] == str(state_value) else '1'
+                    i += 5
+                else:
+                    i += 1
+        
+        # Convert back to bytes
+        bit_str = ''.join(output_bits)
+        byte_length = (len(bit_str) + 7) // 8
+        result = int(bit_str, 2).to_bytes(byte_length, 'big') if bit_str else b''
+        padding = struct.pack('B', min(iteration_count, 255))
+        
+        logging.info(f"transform_14: Compressed {bit_length} bits to {len(result)} bytes, iterations {iteration_count}")
+        return result + padding
+
+    def reverse_transform_14(self, data, repeat=255):
+        """Reverse transform_14 by undoing '01' and '0000'/'1111' pattern processing."""
+        if len(data) < 1:
+            logging.warning("reverse_transform_14: Empty input, returning empty bytes")
+            return b''
+        
+        # Extract iteration count and data
+        iteration_count = min(struct.unpack('B', data[-1:])[0], 255)
+        data = data[:-1]
+        if not data:
+            logging.warning("reverse_transform_14: No data after padding, returning empty bytes")
+            return b''
+        
+        # Convert to binary string
+        binary_str = bin(int.from_bytes(data, 'big'))[2:].zfill(len(data) * 8)
+        bit_length = len(binary_str)
+        if bit_length < MIN_BITS or bit_length > MAX_BITS:
+            logging.warning(f"reverse_transform_14: Input size {bit_length} bits out of range [{MIN_BITS}, {MAX_BITS}]")
+            return data
+        
+        # Determine cycles and XOR bit
+        data_size_kb = len(data) / 1024
+        max_cycles = min(iteration_count, max(1, int(data_size_kb)))
+        prime_index = (len(data) + 1) % len(self.PRIMES)
+        xor_bit = '1' if self.PRIMES[prime_index] % 2 == 0 else '0'
+        
+        # Reverse 4-bit pattern processing
+        output_bits = list(binary_str)
+        if len(output_bits) >= 4:
+            i = 0
+            while i < len(output_bits) - 4:
+                pattern_4 = ''.join(output_bits[i:i+4])
+                pattern_val = int(pattern_4, 2)
+                if pattern_val in [0b0000, 0b1111] and i + 4 < len(output_bits):
+                    state_value = self.state_table.table[pattern_val % len(self.state_table.table)][0] & 1
+                    output_bits[i + 4] = '0' if output_bits[i + 4] == str(state_value) else '1'
+                    i += 5
+                else:
+                    i += 1
+        
+        # Reverse "01" pattern processing
+        for _ in range(max_cycles):
+            temp_bits = []
+            i = 0
+            while i < len(output_bits) - 2:
+                if output_bits[i:i+2] == ['0', '1']:
+                    temp_bits.extend(['0', '1'])
+                    next_bit = output_bits[i+2]
+                    temp_bits.append('0' if next_bit == xor_bit else '1')
+                    i += 3
+                else:
+                    temp_bits.append(output_bits[i])
+                    i += 1
+            temp_bits.extend(output_bits[i:])
+            output_bits = temp_bits
+        
+        # Convert back to bytes
+        bit_str = ''.join(output_bits)
+        byte_length = (len(bit_str) + 7) // 8
+        result = int(bit_str, 2).to_bytes(byte_length, 'big') if bit_str else b''
+        
+        logging.info(f"reverse_transform_14: Extracted {bit_length} bits to {len(result)} bytes, iterations {iteration_count}")
+        return result
+
+    def generate_transform_method(self, n):
+        """Generate transform and reverse transform methods for n >= 15."""
+        def transform(data, repeat=100):
+            if not data:
+                logging.warning(f"transform_{n}: Empty input, returning empty bytes")
+                return b''
+            transformed = bytearray(data)
+            seed_idx = n % len(self.seed_tables)
+            seed_value = self.get_seed(seed_idx, len(data))
+            for i in range(len(transformed)):
+                transformed[i] ^= seed_value
+            return bytes(transformed)
+
+        def reverse_transform(data, repeat=100):
+            return transform(data, repeat)
+
+        return transform, reverse_transform
+
+    def compress_with_best_method(self, data, filetype, input_filename, mode="slow"):
+        """Compress data using the best transformation method."""
+        if not data:
+            logging.warning("compress_with_best_method: Empty input, returning minimal marker")
+            return bytes([0])
+
+        is_dna = False
+        try:
+            data_str = data.decode('ascii').upper()
+            is_dna = all(c in 'ACGT' for c in data_str)
+        except:
+            pass
+
+        fast_transformations = [
+            (1, self.transform_04),
+            (2, self.transform_01),
+            (3, self.transform_03),
+            (5, self.transform_05),
+            (6, self.transform_06),
+            (7, self.transform_07),
+            (8, self.transform_08),
+            (9, self.transform_09),
+            (12, self.transform_12),
+            (14, self.transform_14),
+        ]
+        slow_transformations = fast_transformations + [
+            (10, self.transform_10),
+            (11, self.transform_11),
+            (13, self.transform_13),
+        ] + [(i, self.generate_transform_method(i)[0]) for i in range(15, 256)]
+
+        if is_dna:
+            transformations = [(0, self.transform_genomecompress)] + slow_transformations
+        else:
+            transformations = slow_transformations if mode == "slow" else fast_transformations
+
+        if filetype in [Filetype.JPEG, Filetype.TEXT]:
+            prioritized = [
+                (7, self.transform_07),
+                (8, self.transform_08),
+                (9, self.transform_09),
+                (12, self.transform_12),
+                (13, self.transform_13),
+                (14, self.transform_14),
+            ]
+            if is_dna:
+                prioritized = [(0, self.transform_genomecompress)] + prioritized
+            if mode == "slow":
+                prioritized += [(10, self.transform_10), (11, self.transform_11)] + \
+                              [(i, self.generate_transform_method(i)[0]) for i in range(15, 256)]
+            transformations = prioritized + [t for t in transformations if t[0] not in [0, 7, 8, 9, 10, 11, 12, 13, 14] + list(range(15, 256))]
+
+        methods = [('paq', self.paq_compress)]
+        best_compressed = None
+        best_size = float('inf')
+        best_marker = None
+        best_method = None
+
+        for marker, transform in transformations:
+            transformed = transform(data)
+            for method_name, compress_func in methods:
+                try:
+                    compressed = compress_func(transformed)
+                    if compressed is None:
+                        continue
+                    size = len(compressed)
+                    if size < best_size:
+                        best_size = size
+                        best_compressed = compressed
+                        best_marker = marker
+                        best_method = method_name
+                except Exception as e:
+                    logging.warning(f"Compression method {method_name} with transform {marker} failed: {e}")
+                    continue
+
+        if len(data) < HUFFMAN_THRESHOLD:
+            binary_str = bin(int(binascii.hexlify(data), 16))[2:].zfill(len(data) * 8)
+            compressed_huffman = self.compress_data_huffman(binary_str)
+            compressed_bytes = int(compressed_huffman, 2).to_bytes((len(compressed_huffman) + 7) // 8, 'big') if compressed_huffman else b''
+            if compressed_bytes and len(compressed_bytes) < best_size:
+                best_size = len(compressed_bytes)
+                best_compressed = compressed_bytes
+                best_marker = 4
+                best_method = 'huffman'
+
         if best_compressed is None:
-            logging.warning("No transformation improved compression, returning original data")
+            logging.error("All compression methods failed, returning original with marker 0")
             return bytes([0]) + data
-        logging.info(f"Best transform: marker {best_marker}, Compressed size = {best_size + 1} bytes")
+
+        logging.info(f"Best method: {best_method}, Marker: {best_marker} for {filetype.name} in {mode} mode")
         return bytes([best_marker]) + best_compressed
 
-    def test_all_transformations(self, data, filetype, input_filename):
-        if not data:
-            logging.warning("test_all_transformations: Empty input, skipping")
-            return
-        logging.info(f"Testing all transformations for {input_filename} (size: {len(data)} bytes)")
-        results = []
-        transforms_to_try = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] + list(range(15, 256))
-        if len(data) < HUFFMAN_THRESHOLD:
-            compressed = self.huffman_compress(data)
-            size = len(compressed) + 1 if compressed else len(data)
-            logging.info(f"Huffman (marker 4): Compressed size = {size} bytes")
-            results.append((4, size))
-        for marker in transforms_to_try:
-            try:
-                if marker == 0:
-                    transformed = self.transform_genomecompress(data)
-                elif marker in range(1, 15):
-                    transform_func = getattr(self, f'transform_{marker:02d}')
-                    transformed = transform_func(data)
-                else:
-                    transformed = self.transform_dynamic(data, marker)
-                compressed = self.paq_compress(transformed)
-                size = len(compressed) + 1 if compressed else len(data)
-                logging.info(f"Transform {marker}: Compressed size = {size} bytes")
-                results.append((marker, size))
-            except Exception as e:
-                logging.error(f"Transform {marker} failed: {e}")
-                results.append((marker, len(data)))
-        results.sort(key=lambda x: x[1])
-        logging.info("Transformation results (sorted by compressed size):")
-        for marker, size in results:
-            logging.info(f"Marker {marker}: {size} bytes")
-        return results
-
-    def compress(self, data, filetype, input_filename, mode="slow", force_transform=None):
-        return self.compress_with_best_method(data, filetype, input_filename, mode, force_transform)
-
-    def decompress(self, data, filetype, input_filename):
-        if not data:
-            logging.warning("decompress: Empty input, returning empty bytes")
-            return b''
+    def decompress_with_best_method(self, data):
+        """Decompress data based on marker."""
         if len(data) < 1:
-            logging.error("decompress: Data too short for marker")
-            return None
-        marker = data[0]
-        compressed = data[1:]
-        if marker == 4:
-            if len(data) < HUFFMAN_THRESHOLD:
-                return self.huffman_decompress(compressed)
-            logging.error("Huffman marker used for large data")
-            return None
-        decompressed = self.paq_decompress(compressed)
-        if decompressed is None:
-            logging.error("PAQ9a decompression failed")
-            return None
-        if marker == 0:
-            return self.reverse_transform_genomecompress(decompressed)
-        elif marker in range(1, 15):
-            reverse_func = getattr(self, f'reverse_transform_{marker:02d}', None)
-            if reverse_func is None:
-                logging.error(f"No reverse transform for marker {marker}")
-                return None
-            return reverse_func(decompressed)
-        elif marker in range(15, 256):
-            return self.reverse_transform_dynamic(decompressed, marker)
-        logging.error(f"Invalid marker: {marker}")
-        return None
+            logging.warning("decompress_with_best_method: Insufficient data")
+            return b'', None
 
-def get_filetype(input_filename):
-    ext = os.path.splitext(input_filename)[1].lower()
+        method_marker = data[0]
+        compressed_data = data[1:]
+
+        reverse_transforms = {
+            0: self.reverse_transform_genomecompress,
+            1: self.reverse_transform_04,
+            2: self.reverse_transform_01,
+            3: self.reverse_transform_03,
+            5: self.reverse_transform_05,
+            6: self.reverse_transform_06,
+            7: self.reverse_transform_07,
+            8: self.reverse_transform_08,
+            9: self.reverse_transform_09,
+            10: self.reverse_transform_10,
+            11: self.reverse_transform_11,
+            12: self.reverse_transform_12,
+            13: self.reverse_transform_13,
+            14: self.reverse_transform_14,
+        }
+        reverse_transforms.update({i: self.generate_transform_method(i)[1] for i in range(15, 256)})
+
+        if method_marker == 4:
+            binary_str = bin(int(binascii.hexlify(compressed_data), 16))[2:].zfill(len(compressed_data) * 8)
+            decompressed_binary = self.decompress_data_huffman(binary_str)
+            if not decompressed_binary:
+                logging.warning("Huffman decompression empty")
+                return b'', None
+            try:
+                num_bytes = (len(decompressed_binary) + 7) // 8
+                hex_str = "%0*x" % (num_bytes * 2, int(decompressed_binary, 2))
+                if len(hex_str) % 2 != 0:
+                    hex_str = '0' + hex_str
+                return binascii.unhexlify(hex_str), None
+            except Exception as e:
+                logging.error(f"Huffman data conversion failed: {e}")
+                return b'', None
+
+        if method_marker not in reverse_transforms:
+            logging.error(f"Unknown marker: {method_marker}")
+            return b'', None
+
+        try:
+            decompressed = self.paq_decompress(compressed_data)
+            if not decompressed:
+                logging.warning("PAQ decompression empty")
+                return b'', None
+            result = reverse_transforms[method_marker](decompressed)
+            zero_count = sum(1 for b in result if b == 0)
+            logging.info(f"Decompressed with marker {method_marker}, {zero_count} zeros")
+            return result, method_marker
+        except Exception as e:
+            logging.error(f"PAQ decompression failed: {e}")
+            return b'', None
+
+    def compress(self, input_file: str, output_file: str, filetype: Filetype = Filetype.DEFAULT, mode: str = "slow") -> bool:
+        """Compress a file with the best method."""
+        try:
+            with open(input_file, 'rb') as f:
+                data = f.read()
+            if not data:
+                logging.warning(f"Input file {input_file} is empty")
+                return False
+            compressed = self.compress_with_best_method(data, filetype, input_file, mode)
+            with open(output_file, 'wb') as f:
+                f.write(compressed)
+            logging.info(f"Compressed {input_file} to {output_file}, size {len(compressed)} bytes")
+            return True
+        except Exception as e:
+            logging.error(f"Compression failed for {input_file}: {e}")
+            return False
+
+    def decompress(self, input_file: str, output_file: str) -> bool:
+        """Decompress a file."""
+        try:
+            with open(input_file, 'rb') as f:
+                data = f.read()
+            if not data:
+                logging.warning(f"Input file {input_file} is empty")
+                return False
+            decompressed, marker = self.decompress_with_best_method(data)
+            if not decompressed:
+                logging.error(f"Decompression failed for {input_file}")
+                return False
+            with open(output_file, 'wb') as f:
+                f.write(decompressed)
+            logging.info(f"Decompressed {input_file} to {output_file}, size {len(decompressed)} bytes, marker {marker}")
+            return True
+        except Exception as e:
+            logging.error(f"Decompression failed for {input_file}: {e}")
+            return False
+
+# === Main Function ===
+def detect_filetype(filename: str) -> Filetype:
+    """Detect filetype based on extension or content."""
+    _, ext = os.path.splitext(filename.lower())
     if ext in ['.jpg', '.jpeg']:
         return Filetype.JPEG
-    if ext in ['.txt', '.csv', '.xml']:
+    elif ext in ['.txt', '.dna']:
+        try:
+            with open(filename, 'r', encoding='ascii') as f:
+                sample = f.read(1000)
+                if all(c in 'ACGTacgt\n' for c in sample):
+                    return Filetype.TEXT
+        except:
+            pass
         return Filetype.TEXT
-    try:
-        with open(input_filename, 'rb') as f:
-            data = f.read(100)
-            if data.startswith(b'\xFF\xD8'):
-                return Filetype.JPEG
-            if all(c < 128 for c in data):
-                return Filetype.TEXT
-    except Exception as e:
-        logging.warning(f"Could not read {input_filename} for filetype detection: {e}")
-    return Filetype.DEFAULT
+    else:
+        return Filetype.DEFAULT
 
 def main():
-    print(f"{PROGNAME} version 6.4")
-    smart_compressor = SmartCompressor()
-    paqjp_compressor = PAQJPCompressor()
-    while True:
-        print("\n1. Compress\n2. Decompress\n3. Test All Transformations\n4. Exit")
-        choice = input("Enter choice: ").strip()
-        if choice == '4':
-            break
-        if choice not in ['1', '2', '3']:
-            print("Invalid choice")
-            continue
-        input_filename = input("Enter input filename: ").strip()
-        if not os.path.exists(input_filename):
-            print(f"File {input_filename} does not exist")
-            continue
-        output_filename = input("Enter output filename: ").strip()
-        filetype = get_filetype(input_filename)
-        logging.info(f"Detected filetype: {filetype.name}")
+    """Main function for PAQJP_6.3 Compression System."""
+    print("PAQJP_6.5 Compression System")
+    print("Created by Jurijus Pacalovas")
+    print("Options:")
+    print("1 - Compress file (Best of Smart Compressor [00] or PAQJP_6 [01])")
+    print("2 - Decompress file")
+
+    compressor = PAQJPCompressor()
+
+    try:
+        choice = input("Enter 1 or 2: ").strip()
+        if choice not in ('1', '2'):
+            print("Invalid choice. Exiting.")
+            return
+    except (EOFError, KeyboardInterrupt):
+        print("Program terminated by user")
+        return
+
+    mode = "slow"
+    if choice == '1':
         try:
-            with open(input_filename, 'rb') as f:
-                data = f.read()
-            if choice == '1':
-                mode = input("Enter mode (fast/slow): ").strip().lower()
-                if mode not in ['fast', 'slow']:
-                    print("Invalid mode, using slow")
-                    mode = 'slow'
-                force_transform = input("Force transform (e.g., 1 for transform_01, 0 for genomecompress, leave blank for auto): ").strip()
-                force_transform = int(force_transform) if force_transform.isdigit() else None
-                compressed = paqjp_compressor.compress(data, filetype, input_filename, mode, force_transform)
-                if compressed is None:
-                    compressed = smart_compressor.compress(data, input_filename)
-                if compressed:
-                    with open(output_filename, 'wb') as f:
-                        f.write(compressed)
-                    print(f"Compressed to {output_filename} (size: {len(compressed)} bytes)")
-                else:
-                    print("Compression failed")
-            elif choice == '2':
-                decompressed = paqjp_compressor.decompress(data, filetype, input_filename)
-                if decompressed is None:
-                    decompressed = smart_compressor.decompress(data, input_filename)
-                if decompressed:
-                    with open(output_filename, 'wb') as f:
-                        f.write(decompressed)
-                    print(f"Decompressed to {output_filename} (size: {len(decompressed)} bytes)")
-                else:
-                    print("Decompression failed")
-            elif choice == '3':
-                paqjp_compressor.test_all_transformations(data, filetype, input_filename)
-                smart_compressed = smart_compressor.compress(data, input_filename)
-                logging.info(f"SmartCompressor: Compressed size = {len(smart_compressed)} bytes")
-                print("Transformation test results logged to compression_results.log")
-        except Exception as e:
-            logging.error(f"Operation failed: {e}")
-            print(f"Error: {e}")
+            mode_choice = input("Enter compression mode (1 for fast, 2 for slow): ").strip()
+            if mode_choice == '1':
+                mode = "fast"
+            elif mode_choice == '2':
+                mode = "slow"
+            else:
+                print("Invalid mode, defaulting to slow")
+                mode = "slow"
+        except (EOFError, KeyboardInterrupt):
+            print("Defaulting to slow mode")
+            mode = "slow"
+
+        input_file = input("Enter input file path: ").strip()
+        output_file = input("Enter output file path: ").strip()
+
+        if not os.path.exists(input_file):
+            print(f"Input file {input_file} not found")
+            return
+        if not os.access(input_file, os.R_OK):
+            print(f"No read permission for {input_file}")
+            return
+        if os.path.getsize(input_file) == 0:
+            print(f"Input file {input_file} is empty")
+            with open(output_file, 'wb') as f:
+                f.write(bytes([0]))
+            return
+
+        filetype = detect_filetype(input_file)
+        success = compressor.compress(input_file, output_file, filetype, mode)
+        if success:
+            orig_size = os.path.getsize(input_file)
+            comp_size = os.path.getsize(output_file)
+            ratio = (comp_size / orig_size) * 100 if orig_size > 0 else 0
+            print(f"Compression successful: {output_file}, Size: {comp_size} bytes")
+            print(f"Original: {orig_size} bytes, Compressed: {comp_size} bytes, Ratio: {ratio:.2f}%")
+        else:
+            print("Compression failed")
+
+    elif choice == '2':
+        input_file = input("Enter input file path: ").strip()
+        output_file = input("Enter output file path: ").strip()
+
+        if not os.path.exists(input_file):
+            print(f"Input file {input_file} not found")
+            return
+        if not os.access(input_file, os.R_OK):
+            print(f"No read permission for {input_file}")
+            return
+        if os.path.getsize(input_file) == 0:
+            print(f"Input file {input_file} is empty")
+            with open(output_file, 'wb') as f:
+                f.write(b'')
+            return
+
+        success = compressor.decompress(input_file, output_file)
+        if success:
+            comp_size = os.path.getsize(input_file)
+            decomp_size = os.path.getsize(output_file)
+            print(f"Decompression successful: {output_file}")
+            print(f"Compressed: {comp_size} bytes, Decompressed: {decomp_size} bytes")
+        else:
+            print("Decompression failed")
 
 if __name__ == "__main__":
     main()
