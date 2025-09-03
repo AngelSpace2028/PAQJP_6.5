@@ -20,7 +20,7 @@ logging.basicConfig(
 )
 
 # === Constants ===
-PROGNAME = "PAQJP_6.5_Smart"
+PROGNAME = "PAQJP_6_Smart"
 HUFFMAN_THRESHOLD = 1024  # Bytes threshold for Huffman vs. PAQ compression
 PI_DIGITS_FILE = "pi_digits.txt"
 PRIMES = [p for p in range(2, 256) if all(p % d != 0 for d in range(2, int(p**0.5)+1))]
@@ -1079,7 +1079,7 @@ class PAQJPCompressor:
         return bytes(transformed)
 
     def transform_14(self, data, repeat=255):
-        """Transform data by processing '00' and '11' patterns, then '0000'/'1111' patterns."""
+        """Transform data by processing '01' and '0000'/'1111' patterns."""
         if not data:
             logging.warning("transform_14: Empty input, returning minimal output")
             return struct.pack('B', 0)
@@ -1099,49 +1099,41 @@ class PAQJPCompressor:
         prime_index = len(data) % len(self.PRIMES)
         xor_bit = '1' if self.PRIMES[prime_index] % 2 == 0 else '0'
         
-        # Process "00" and "11" patterns
+        # Process "01" patterns
         output_bits = list(binary_str)
         iteration_count = 0
         for _ in range(max_cycles):
             temp_bits = []
             i = 0
             modified = False
-            while i < len(output_bits):
-                if i + 2 <= len(output_bits) and output_bits[i:i+2] in [['0', '0'], ['1', '1']]:
-                    temp_bits.extend(output_bits[i:i+2])  # Copy "00" or "11"
-                    if i + 2 < len(output_bits):  # Check if next bit exists
-                        next_bit = output_bits[i+2]
-                        temp_bits.append('0' if next_bit == xor_bit else '1')
-                        modified = True
-                        i += 3
-                    else:
-                        i += 2  # No next bit, skip pattern
+            while i < len(output_bits) - 2:
+                if output_bits[i:i+2] == ['0', '1']:
+                    temp_bits.extend(['0', '1'])
+                    next_bit = output_bits[i+2]
+                    temp_bits.append('0' if next_bit == xor_bit else '1')
+                    modified = True
+                    i += 3
                 else:
                     temp_bits.append(output_bits[i])
                     i += 1
+            temp_bits.extend(output_bits[i:])
             output_bits = temp_bits
             iteration_count += 1
             if not modified or len(''.join(output_bits)) // 8 >= 32:
                 break
         
-        # Process "0000" and "1111" patterns
+        # Process 4-bit patterns ("0000" or "1111") with StateTable
         if len(output_bits) >= 4:
             i = 0
-            while i < len(output_bits):
-                if i + 4 <= len(output_bits):
-                    pattern_4 = ''.join(output_bits[i:i+4])
-                    pattern_val = int(pattern_4, 2)
-                    if pattern_val in [0b0000, 0b1111]:  # Check for "0000" or "1111"
-                        if i + 4 < len(output_bits):  # Ensure next bit exists
-                            state_value = self.state_table.table[pattern_val % len(self.state_table.table)][0] & 1
-                            output_bits[i + 4] = '0' if output_bits[i + 4] == str(state_value) else '1'
-                            i += 5
-                        else:
-                            i += 4  # No next bit, skip pattern
-                    else:
-                        i += 1
+            while i < len(output_bits) - 4:
+                pattern_4 = ''.join(output_bits[i:i+4])
+                pattern_val = int(pattern_4, 2)
+                if pattern_val in [0b0000, 0b1111] and i + 4 < len(output_bits):
+                    state_value = self.state_table.table[pattern_val % len(self.state_table.table)][0] & 1
+                    output_bits[i + 4] = '0' if output_bits[i + 4] == str(state_value) else '1'
+                    i += 5
                 else:
-                    i += 1  # Move to next bit if insufficient bits remain
+                    i += 1
         
         # Convert back to bytes
         bit_str = ''.join(output_bits)
@@ -1149,11 +1141,11 @@ class PAQJPCompressor:
         result = int(bit_str, 2).to_bytes(byte_length, 'big') if bit_str else b''
         padding = struct.pack('B', min(iteration_count, 255))
         
-        logging.info(f"transform_14: Processed {bit_length} bits to {len(result)} bytes, iterations {iteration_count}")
+        logging.info(f"transform_14: Compressed {bit_length} bits to {len(result)} bytes, iterations {iteration_count}")
         return result + padding
 
     def reverse_transform_14(self, data, repeat=255):
-        """Reverse transform_14 by undoing '0000'/'1111' and '00'/'11' pattern processing."""
+        """Reverse transform_14 by undoing '01' and '0000'/'1111' pattern processing."""
         if len(data) < 1:
             logging.warning("reverse_transform_14: Empty input, returning empty bytes")
             return b''
@@ -1178,42 +1170,34 @@ class PAQJPCompressor:
         prime_index = (len(data) + 1) % len(self.PRIMES)
         xor_bit = '1' if self.PRIMES[prime_index] % 2 == 0 else '0'
         
-        # Reverse "0000" and "1111" pattern processing
+        # Reverse 4-bit pattern processing
         output_bits = list(binary_str)
         if len(output_bits) >= 4:
             i = 0
-            while i < len(output_bits):
-                if i + 4 <= len(output_bits):
-                    pattern_4 = ''.join(output_bits[i:i+4])
-                    pattern_val = int(pattern_4, 2)
-                    if pattern_val in [0b0000, 0b1111]:  # Check for "0000" or "1111"
-                        if i + 4 < len(output_bits):  # Ensure next bit exists
-                            state_value = self.state_table.table[pattern_val % len(self.state_table.table)][0] & 1
-                            output_bits[i + 4] = str(state_value) if output_bits[i + 4] == '0' else str(1 - state_value)
-                            i += 5
-                        else:
-                            i += 4  # No next bit, skip pattern
-                    else:
-                        i += 1
+            while i < len(output_bits) - 4:
+                pattern_4 = ''.join(output_bits[i:i+4])
+                pattern_val = int(pattern_4, 2)
+                if pattern_val in [0b0000, 0b1111] and i + 4 < len(output_bits):
+                    state_value = self.state_table.table[pattern_val % len(self.state_table.table)][0] & 1
+                    output_bits[i + 4] = '0' if output_bits[i + 4] == str(state_value) else '1'
+                    i += 5
                 else:
-                    i += 1  # Move to next bit if insufficient bits remain
+                    i += 1
         
-        # Reverse "00" and "11" pattern processing
+        # Reverse "01" pattern processing
         for _ in range(max_cycles):
             temp_bits = []
             i = 0
-            while i < len(output_bits):
-                if i + 2 <= len(output_bits) and output_bits[i:i+2] in [['0', '0'], ['1', '1']]:
-                    temp_bits.extend(output_bits[i:i+2])  # Copy "00" or "11"
-                    if i + 2 < len(output_bits):  # Check if next bit exists
-                        next_bit = output_bits[i+2]
-                        temp_bits.append(xor_bit if next_bit == '0' else ('1' if xor_bit == '0' else '0'))
-                        i += 3
-                    else:
-                        i += 2  # No next bit, skip pattern
+            while i < len(output_bits) - 2:
+                if output_bits[i:i+2] == ['0', '1']:
+                    temp_bits.extend(['0', '1'])
+                    next_bit = output_bits[i+2]
+                    temp_bits.append('0' if next_bit == xor_bit else '1')
+                    i += 3
                 else:
                     temp_bits.append(output_bits[i])
                     i += 1
+            temp_bits.extend(output_bits[i:])
             output_bits = temp_bits
         
         # Convert back to bytes
@@ -1408,77 +1392,131 @@ class PAQJPCompressor:
             logging.info(f"Compressed {input_file} to {output_file}, size {len(compressed)} bytes")
             return True
         except Exception as e:
-            ​​​​​​​​​​​​​​​​​​
             logging.error(f"Compression failed for {input_file}: {e}")
             return False
 
     def decompress(self, input_file: str, output_file: str) -> bool:
-        """Decompress a file using the appropriate method based on marker."""
+        """Decompress a file."""
         try:
             with open(input_file, 'rb') as f:
                 data = f.read()
             if not data:
                 logging.warning(f"Input file {input_file} is empty")
                 return False
-            decompressed, method_marker = self.decompress_with_best_method(data)
-            if decompressed is None:
+            decompressed, marker = self.decompress_with_best_method(data)
+            if not decompressed:
                 logging.error(f"Decompression failed for {input_file}")
                 return False
             with open(output_file, 'wb') as f:
                 f.write(decompressed)
-            logging.info(f"Decompressed {input_file} to {output_file}, method marker {method_marker}, size {len(decompressed)} bytes")
+            logging.info(f"Decompressed {input_file} to {output_file}, size {len(decompressed)} bytes, marker {marker}")
             return True
         except Exception as e:
             logging.error(f"Decompression failed for {input_file}: {e}")
             return False
 
-# === Main Execution ===
+# === Main Function ===
+def detect_filetype(filename: str) -> Filetype:
+    """Detect filetype based on extension or content."""
+    _, ext = os.path.splitext(filename.lower())
+    if ext in ['.jpg', '.jpeg']:
+        return Filetype.JPEG
+    elif ext in ['.txt', '.dna']:
+        try:
+            with open(filename, 'r', encoding='ascii') as f:
+                sample = f.read(1000)
+                if all(c in 'ACGTacgt\n' for c in sample):
+                    return Filetype.TEXT
+        except:
+            pass
+        return Filetype.TEXT
+    else:
+        return Filetype.DEFAULT
+
 def main():
-    """Main function to handle command-line arguments and execute compression/decompression."""
-    if len(sys.argv) < 4:
-        print(f"Usage: {sys.argv[0]} <compress|decompress> <input_file> <output_file> [mode=slow|fast] [filetype=default|jpeg|text]")
-        sys.exit(1)
-
-    operation = sys.argv[1].lower()
-    input_file = sys.argv[2]
-    output_file = sys.argv[3]
-    mode = sys.argv[4].lower() if len(sys.argv) > 4 else "slow"
-    filetype_str = sys.argv[5].lower() if len(sys.argv) > 5 else "default"
-
-    # Validate filetype
-    filetype_map = {
-        "default": Filetype.DEFAULT,
-        "jpeg": Filetype.JPEG,
-        "text": Filetype.TEXT
-    }
-    filetype = filetype_map.get(filetype_str, Filetype.DEFAULT)
-    if filetype_str not in filetype_map:
-        logging.warning(f"Unknown filetype '{filetype_str}', defaulting to {filetype.name}")
-
-    # Validate mode
-    if mode not in ["slow", "fast"]:
-        logging.warning(f"Unknown mode '{mode}', defaulting to 'slow'")
-        mode = "slow"
+    """Main function for PAQJP_6.3 Compression System."""
+    print("PAQJP_6.5 Compression System")
+    print("Created by Jurijus Pacalovas")
+    print("Options:")
+    print("1 - Compress file (Best of Smart Compressor [00] or PAQJP_6 [01])")
+    print("2 - Decompress file")
 
     compressor = PAQJPCompressor()
-    
-    if operation == "compress":
+
+    try:
+        choice = input("Enter 1 or 2: ").strip()
+        if choice not in ('1', '2'):
+            print("Invalid choice. Exiting.")
+            return
+    except (EOFError, KeyboardInterrupt):
+        print("Program terminated by user")
+        return
+
+    mode = "slow"
+    if choice == '1':
+        try:
+            mode_choice = input("Enter compression mode (1 for fast, 2 for slow): ").strip()
+            if mode_choice == '1':
+                mode = "fast"
+            elif mode_choice == '2':
+                mode = "slow"
+            else:
+                print("Invalid mode, defaulting to slow")
+                mode = "slow"
+        except (EOFError, KeyboardInterrupt):
+            print("Defaulting to slow mode")
+            mode = "slow"
+
+        input_file = input("Enter input file path: ").strip()
+        output_file = input("Enter output file path: ").strip()
+
+        if not os.path.exists(input_file):
+            print(f"Input file {input_file} not found")
+            return
+        if not os.access(input_file, os.R_OK):
+            print(f"No read permission for {input_file}")
+            return
+        if os.path.getsize(input_file) == 0:
+            print(f"Input file {input_file} is empty")
+            with open(output_file, 'wb') as f:
+                f.write(bytes([0]))
+            return
+
+        filetype = detect_filetype(input_file)
         success = compressor.compress(input_file, output_file, filetype, mode)
         if success:
-            logging.info(f"Successfully compressed {input_file} to {output_file}")
+            orig_size = os.path.getsize(input_file)
+            comp_size = os.path.getsize(output_file)
+            ratio = (comp_size / orig_size) * 100 if orig_size > 0 else 0
+            print(f"Compression successful: {output_file}, Size: {comp_size} bytes")
+            print(f"Original: {orig_size} bytes, Compressed: {comp_size} bytes, Ratio: {ratio:.2f}%")
         else:
-            logging.error(f"Failed to compress {input_file}")
-            sys.exit(1)
-    elif operation == "decompress":
+            print("Compression failed")
+
+    elif choice == '2':
+        input_file = input("Enter input file path: ").strip()
+        output_file = input("Enter output file path: ").strip()
+
+        if not os.path.exists(input_file):
+            print(f"Input file {input_file} not found")
+            return
+        if not os.access(input_file, os.R_OK):
+            print(f"No read permission for {input_file}")
+            return
+        if os.path.getsize(input_file) == 0:
+            print(f"Input file {input_file} is empty")
+            with open(output_file, 'wb') as f:
+                f.write(b'')
+            return
+
         success = compressor.decompress(input_file, output_file)
         if success:
-            logging.info(f"Successfully decompressed {input_file} to {output_file}")
+            comp_size = os.path.getsize(input_file)
+            decomp_size = os.path.getsize(output_file)
+            print(f"Decompression successful: {output_file}")
+            print(f"Compressed: {comp_size} bytes, Decompressed: {decomp_size} bytes")
         else:
-            logging.error(f"Failed to decompress {input_file}")
-            sys.exit(1)
-    else:
-        print(f"Unknown operation: {operation}. Use 'compress' or 'decompress'")
-        sys.exit(1)
+            print("Decompression failed")
 
 if __name__ == "__main__":
     main()
