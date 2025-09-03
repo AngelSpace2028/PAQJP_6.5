@@ -1408,7 +1408,7 @@ class PAQJPCompressor:
             logging.info(f"Compressed {input_file} to {output_file}, size {len(compressed)} bytes")
             return True
         except Exception as e:
-            logging.error(f"Compression failed​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+            ​​​​​​​​​​​​​​​​​​
             logging.error(f"Compression failed for {input_file}: {e}")
             return False
 
